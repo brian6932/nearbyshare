@@ -1,29 +1,65 @@
 include!(concat!(env!("OUT_DIR"), "/mod.rs"));
 
-use std::{io::{self, Write}, collections::HashMap, error::Error};
+use std::{
+    collections::HashMap,
+    error::Error,
+    io::{self, Write},
+};
 
-use aes::cipher::{BlockDecryptMut, block_padding::Pkcs7, KeyIvInit, BlockEncryptMut};
+use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
+use base64::{engine::general_purpose, Engine as _};
 use hkdf::Hkdf;
 use hmac::Mac;
 use mdns_sd::{ServiceDaemon, ServiceInfo};
-use base64::{engine::general_purpose, Engine as _};
 use offline_wire_formats::KeepAliveFrame;
-use p256::{ecdh::EphemeralSecret, EncodedPoint, elliptic_curve::{generic_array::GenericArray, sec1::FromEncodedPoint}, PublicKey};
-use protobuf::{Message, SpecialFields, MessageField, Enum};
-use rand::{RngCore, rngs::OsRng};
-use sha2::{Sha512, Digest, Sha256};
-use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::{TcpListener, TcpStream}, signal::unix::{signal, SignalKind}, sync::mpsc::{self, Sender}};
+use p256::{
+    ecdh::EphemeralSecret,
+    elliptic_curve::{generic_array::GenericArray, sec1::FromEncodedPoint},
+    EncodedPoint, PublicKey,
+};
+use protobuf::{Enum, Message, MessageField, SpecialFields};
+use rand::{rngs::OsRng, RngCore};
+use sha2::{Digest, Sha256, Sha512};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+    signal::ctrl_c,
+    sync::mpsc::{self, Sender},
+};
 
-use crate::{offline_wire_formats::{OfflineFrame, ConnectionResponseFrame, connection_response_frame::ResponseStatus, os_info::OsType, OsInfo, offline_frame, v1frame::FrameType, payload_transfer_frame::{PacketType, payload_header::PayloadType, PayloadHeader, PayloadChunk, payload_chunk::Flags}, PayloadTransferFrame}, ukey::{Ukey2ClientInit, Ukey2ServerInit, Ukey2Message, Ukey2HandshakeCipher, Ukey2Alert, ukey2message, Ukey2ClientFinished}, securemessage::{PublicKeyType, EcP256PublicKey, GenericPublicKey, SecureMessage, HeaderAndBody, SigScheme, Header, EncScheme}, securegcm::GcmMetadata, device_to_device_messages::DeviceToDeviceMessage, wire_format::{Frame, frame, PairedKeyEncryptionFrame, paired_key_result_frame, PairedKeyResultFrame}};
+use crate::{
+    device_to_device_messages::DeviceToDeviceMessage,
+    offline_wire_formats::{
+        connection_response_frame::ResponseStatus,
+        offline_frame,
+        os_info::OsType,
+        payload_transfer_frame::{
+            payload_chunk::Flags, payload_header::PayloadType, PacketType, PayloadChunk,
+            PayloadHeader,
+        },
+        v1frame::FrameType,
+        ConnectionResponseFrame, OfflineFrame, OsInfo, PayloadTransferFrame,
+    },
+    securegcm::GcmMetadata,
+    securemessage::{
+        EcP256PublicKey, EncScheme, GenericPublicKey, Header, HeaderAndBody, PublicKeyType,
+        SecureMessage, SigScheme,
+    },
+    ukey::{
+        ukey2message, Ukey2Alert, Ukey2ClientFinished, Ukey2ClientInit, Ukey2HandshakeCipher,
+        Ukey2Message, Ukey2ServerInit,
+    },
+    wire_format::{
+        frame, paired_key_result_frame, Frame, PairedKeyEncryptionFrame, PairedKeyResultFrame,
+    },
+};
 
 type Aes256CbcEnc = cbc::Encryptor<aes::Aes256>;
 type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
 
 fn b64(bytes: &[u8]) -> String {
     let str = general_purpose::STANDARD.encode(bytes);
-    str.replace('=', "")
-       .replace('/', "_")
-       .replace('+', "-")
+    str.replace('=', "").replace('/', "_").replace('+', "-")
 }
 
 fn broadcast_dns(port: u16, shutdown: Sender<()>) -> Result<(), Box<dyn Error>> {
@@ -45,7 +81,9 @@ fn broadcast_dns(port: u16, shutdown: Sender<()>) -> Result<(), Box<dyn Error>> 
     // 3 bits for device type, 0 = unknown, 1 = phone, 2 = tablet, 3 = laptop
     // 1 bit reserved
     let flags: u8 = 0b00000110;
-    let mut n = vec![flags, 0x0, 0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8, 0x9, 0xa, 0xb, 0xc, 0xd, 0xe, 0xf];
+    let mut n = vec![
+        flags, 0x0, 0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8, 0x9, 0xa, 0xb, 0xc, 0xd, 0xe, 0xf,
+    ];
     n.push(host_name.as_bytes().len() as u8);
     n.extend_from_slice(host_name.as_bytes());
 
@@ -59,29 +97,13 @@ fn broadcast_dns(port: u16, shutdown: Sender<()>) -> Result<(), Box<dyn Error>> 
         port,
         &properties[..],
     )?
-        .enable_addr_auto();
+    .enable_addr_auto();
     dbg!(&my_service);
-
-    let full_name = my_service.get_fullname().to_string();
 
     // Register with the daemon, which publishes the service.
     mdns.register(my_service)?;
 
-    tokio::spawn(async move {
-        let die = async {
-            println!("unregistering");
-            mdns.unregister(&full_name).unwrap();
-            mdns.shutdown().unwrap();
-            shutdown.send(()).await.unwrap();
-        };
-
-        let mut int = signal(SignalKind::interrupt()).unwrap();
-        let mut term = signal(SignalKind::terminate()).unwrap();
-        tokio::select! {
-            _ = int.recv() => die.await,
-            _ = term.recv() => die.await,
-        }
-    });
+    tokio::spawn(ctrl_c());
 
     Ok(())
 }
@@ -121,7 +143,11 @@ fn do_hkdf(salt: &[u8], input_key: &[u8], info: &[u8], size: usize) -> Vec<u8> {
     okm
 }
 
-fn sign_and_encrypt_d2d(encrypt_key: &[u8], send_hmac_key: &[u8], d2dmsg: &DeviceToDeviceMessage) -> SecureMessage {
+fn sign_and_encrypt_d2d(
+    encrypt_key: &[u8],
+    send_hmac_key: &[u8],
+    d2dmsg: &DeviceToDeviceMessage,
+) -> SecureMessage {
     let mut iv = vec![0u8; 16];
     rand::thread_rng().fill_bytes(&mut iv);
 
@@ -153,7 +179,11 @@ fn sign_and_encrypt_d2d(encrypt_key: &[u8], send_hmac_key: &[u8], d2dmsg: &Devic
     securemessage
 }
 
-fn verify_and_decrypt_d2d(secure_message: SecureMessage, decrypt_key: &[u8], receive_hmac_key: &[u8]) -> Result<DeviceToDeviceMessage, Box<dyn std::error::Error>> {
+fn verify_and_decrypt_d2d(
+    secure_message: SecureMessage,
+    decrypt_key: &[u8],
+    receive_hmac_key: &[u8],
+) -> Result<DeviceToDeviceMessage, Box<dyn std::error::Error>> {
     let header_and_body = HeaderAndBody::parse_from_bytes(secure_message.header_and_body())?;
 
     let gcm_metadata = GcmMetadata::parse_from_bytes(header_and_body.header.public_metadata())?;
@@ -179,7 +209,13 @@ fn encode_payload_chunks(id: i64, data: &[u8]) -> Vec<OfflineFrame> {
     const MAX_CHUNK_SIZE: usize = 8 * 1024 * 1024; // TODO: pick a good value
     let mut res = vec![];
 
-    fn new_frame(id: i64, offset: usize, chunk: &[u8], total_size: usize, last: bool) -> OfflineFrame {
+    fn new_frame(
+        id: i64,
+        offset: usize,
+        chunk: &[u8],
+        total_size: usize,
+        last: bool,
+    ) -> OfflineFrame {
         let mut payload_header = PayloadHeader::new();
         payload_header.set_id(id);
         payload_header.set_type(PayloadType::BYTES);
@@ -218,7 +254,13 @@ fn encode_payload_chunks(id: i64, data: &[u8]) -> Vec<OfflineFrame> {
     res
 }
 
-async fn send_frame(socket: &mut TcpStream, frame: &Frame, encrypt_key: &[u8], send_hmac_key: &[u8], server_seq_num: &mut i32) {
+async fn send_frame(
+    socket: &mut TcpStream,
+    frame: &Frame,
+    encrypt_key: &[u8],
+    send_hmac_key: &[u8],
+    server_seq_num: &mut i32,
+) {
     let data = frame.write_to_bytes().unwrap();
 
     let id = rand::thread_rng().next_u64() as i64;
@@ -250,7 +292,13 @@ enum TransferResult {
     Keepalive,
 }
 
-async fn read_next_transfer(transfers: &mut HashMap<i64, TransferState>, socket: &mut TcpStream, decrypt_key: &[u8], receive_hmac_key: &[u8], client_seq_num: &mut i32) -> TransferResult {
+async fn read_next_transfer(
+    transfers: &mut HashMap<i64, TransferState>,
+    socket: &mut TcpStream,
+    decrypt_key: &[u8],
+    receive_hmac_key: &[u8],
+    client_seq_num: &mut i32,
+) -> TransferResult {
     println!("---------------------------------------------\n\n");
     *client_seq_num += 1;
 
@@ -266,15 +314,23 @@ async fn read_next_transfer(transfers: &mut HashMap<i64, TransferState>, socket:
     }
 
     assert_eq!(offline_frame.v1.type_(), FrameType::PAYLOAD_TRANSFER);
-    assert_eq!(offline_frame.v1.payload_transfer.packet_type(), PacketType::DATA);
+    assert_eq!(
+        offline_frame.v1.payload_transfer.packet_type(),
+        PacketType::DATA
+    );
 
     let header = &offline_frame.v1.payload_transfer.payload_header;
 
-    let transfer = transfers.entry(header.id()).or_insert_with(|| TransferState {
-        data: vec![],
-        typ: header.type_()
-    });
-    assert_eq!(offline_frame.v1.payload_transfer.payload_chunk.offset() as usize, transfer.data.len());
+    let transfer = transfers
+        .entry(header.id())
+        .or_insert_with(|| TransferState {
+            data: vec![],
+            typ: header.type_(),
+        });
+    assert_eq!(
+        offline_frame.v1.payload_transfer.payload_chunk.offset() as usize,
+        transfer.data.len()
+    );
     assert_eq!(transfer.typ, header.type_());
 
     let buf = offline_frame.v1.payload_transfer.payload_chunk.body();
@@ -283,12 +339,14 @@ async fn read_next_transfer(transfers: &mut HashMap<i64, TransferState>, socket:
     if offline_frame.v1.payload_transfer.payload_chunk.flags() & Flags::LAST_CHUNK.value() != 0 {
         let transfer = transfers.remove(&header.id()).unwrap();
         let res = match transfer.typ {
-            PayloadType::BYTES => TransferResult::Frame(Frame::parse_from_bytes(&transfer.data).unwrap()),
-            PayloadType::FILE  => TransferResult::Bytes(header.id(), transfer.data),
+            PayloadType::BYTES => {
+                TransferResult::Frame(Frame::parse_from_bytes(&transfer.data).unwrap())
+            }
+            PayloadType::FILE => TransferResult::Bytes(header.id(), transfer.data),
             _ => panic!("unknown payload type {:?}", transfer.typ),
         };
         //println!("transfer complete: {:?}", res);
-        return res
+        return res;
     }
 
     TransferResult::Nothing
@@ -327,7 +385,8 @@ impl From<PublicKey> for securemessage::GenericPublicKey {
             x: Some(x),
             y: Some(y),
             special_fields: SpecialFields::default(),
-        }).into();
+        })
+        .into();
 
         public_key_pb
     }
@@ -341,8 +400,8 @@ impl From<securemessage::GenericPublicKey> for PublicKey {
         let y = gpk.ec_p256_public_key.y.as_ref().unwrap();
         // cut off leading 0x00 byte from incoming two's complement ints, as p256 uses unsigned ints
         // TODO: handle lengths shorter than 32 bytes
-        let x = &x[x.len()-32..];
-        let y = &y[y.len()-32..];
+        let x = &x[x.len() - 32..];
+        let y = &y[y.len() - 32..];
 
         // positive integers in two's complement are represented the same way as unsigned integers
         let client_pub_key_pt = EncodedPoint::from_affine_coordinates(
@@ -356,7 +415,10 @@ impl From<securemessage::GenericPublicKey> for PublicKey {
 
 async fn write_msg(socket: &mut TcpStream, message: &impl protobuf::Message) {
     let bytes = message.write_to_bytes().unwrap();
-    socket.write_all(&(bytes.len() as u32).to_be_bytes()).await.unwrap();
+    socket
+        .write_all(&(bytes.len() as u32).to_be_bytes())
+        .await
+        .unwrap();
     socket.write_all(&bytes).await.unwrap();
 }
 
@@ -366,7 +428,12 @@ async fn process(mut socket: TcpStream) -> io::Result<()> {
 
     let offline = OfflineFrame::parse_from_bytes(&buf).unwrap();
     println!("< {:?}", offline.v1.type_.unwrap());
-    let endpoint_info = offline.v1.connection_request.endpoint_info.as_ref().unwrap();
+    let endpoint_info = offline
+        .v1
+        .connection_request
+        .endpoint_info
+        .as_ref()
+        .unwrap();
     println!("endpoint_info: {:?}", endpoint_info);
 
     let device_type_id = (endpoint_info[0] & 0b1110) >> 1;
@@ -380,7 +447,7 @@ async fn process(mut socket: TcpStream) -> io::Result<()> {
     println!("device_type: {}", device_type);
 
     let device_name_size = endpoint_info[17] as usize;
-    let device_name = std::str::from_utf8(&endpoint_info[18..18+device_name_size]).unwrap();
+    let device_name = std::str::from_utf8(&endpoint_info[18..18 + device_name_size]).unwrap();
     println!("device_name: {}", device_name);
 
     // UKEY2 Client Init
@@ -391,12 +458,17 @@ async fn process(mut socket: TcpStream) -> io::Result<()> {
     let ukey2_message = Ukey2Message::parse_from_bytes(&buf).unwrap();
     println!("< {:?}", ukey2_message);
 
-    let ukey2_client_init = Ukey2ClientInit::parse_from_bytes(ukey2_message.message_data()).unwrap();
+    let ukey2_client_init =
+        Ukey2ClientInit::parse_from_bytes(ukey2_message.message_data()).unwrap();
     println!("< {:?}", ukey2_client_init);
 
     assert!(ukey2_client_init.next_protocol.unwrap() == "AES_256_CBC-HMAC_SHA256");
 
-    let cipher = ukey2_client_init.cipher_commitments.iter().find(|c| c.handshake_cipher() == Ukey2HandshakeCipher::P256_SHA512).unwrap();
+    let cipher = ukey2_client_init
+        .cipher_commitments
+        .iter()
+        .find(|c| c.handshake_cipher() == Ukey2HandshakeCipher::P256_SHA512)
+        .unwrap();
 
     let secret_key = EphemeralSecret::random(&mut OsRng);
     let public_key_pb = GenericPublicKey::from(secret_key.public_key());
@@ -428,17 +500,26 @@ async fn process(mut socket: TcpStream) -> io::Result<()> {
 
     let ukey2_message = Ukey2Message::parse_from_bytes(&buf).unwrap();
     println!("< {:?}", ukey2_message);
-    assert_eq!(ukey2_message.message_type, Some(ukey2message::Type::CLIENT_FINISH.into()));
+    assert_eq!(
+        ukey2_message.message_type,
+        Some(ukey2message::Type::CLIENT_FINISH.into())
+    );
 
     // verify commitment hash
     assert_eq!(Sha512::digest(buf).as_slice(), cipher.commitment());
 
-    let ukey2_client_finished = Ukey2ClientFinished::parse_from_bytes(ukey2_message.message_data()).unwrap();
+    let ukey2_client_finished =
+        Ukey2ClientFinished::parse_from_bytes(ukey2_message.message_data()).unwrap();
 
-    let client_pub_key = GenericPublicKey::parse_from_bytes(&ukey2_client_finished.public_key.unwrap()).unwrap();
+    let client_pub_key =
+        GenericPublicKey::parse_from_bytes(&ukey2_client_finished.public_key.unwrap()).unwrap();
     let client_pub_key = PublicKey::from(client_pub_key);
 
-    let shared_secret = Sha256::digest(secret_key.diffie_hellman(&client_pub_key).raw_secret_bytes());
+    let shared_secret = Sha256::digest(
+        secret_key
+            .diffie_hellman(&client_pub_key)
+            .raw_secret_bytes(),
+    );
 
     // deriving keys
     let m3 = [m1, m2].concat();
@@ -447,12 +528,14 @@ async fn process(mut socket: TcpStream) -> io::Result<()> {
     let next_protocol_secret = do_hkdf(b"UKEY2 v1 next", &shared_secret, &m3, 32);
 
     // this is sha256("D2D")
-    let d2d_salt = hex::decode("82AA55A0D397F88346CA1CEE8D3909B95F13FA7DEB1D4AB38376B8256DA85510").unwrap();
+    let d2d_salt =
+        hex::decode("82AA55A0D397F88346CA1CEE8D3909B95F13FA7DEB1D4AB38376B8256DA85510").unwrap();
     let d2d_client_key = do_hkdf(&d2d_salt, &next_protocol_secret, b"client", 32);
     let d2d_server_key = do_hkdf(&d2d_salt, &next_protocol_secret, b"server", 32);
 
     // this is sha256("SecureMessage")
-    let salt = hex::decode("BF9D2A53C63616D75DB0A7165B91C1EF73E537F2427405FA23610A4BE657642E").unwrap();
+    let salt =
+        hex::decode("BF9D2A53C63616D75DB0A7165B91C1EF73E537F2427405FA23610A4BE657642E").unwrap();
     let decrypt_key = do_hkdf(&salt, &d2d_client_key, b"ENC:2", 32);
     let receive_hmac_key = do_hkdf(&salt, &d2d_client_key, b"SIG:1", 32);
     let encrypt_key = do_hkdf(&salt, &d2d_server_key, b"ENC:2", 32);
@@ -472,7 +555,10 @@ async fn process(mut socket: TcpStream) -> io::Result<()> {
     let mut connection_response = ConnectionResponseFrame::new();
     connection_response.set_status(0);
     connection_response.set_response(ResponseStatus::ACCEPT);
-    connection_response.os_info = MessageField::some(OsInfo { type_: Some(OsType::LINUX.into()), special_fields: SpecialFields::default() });
+    connection_response.os_info = MessageField::some(OsInfo {
+        type_: Some(OsType::LINUX.into()),
+        special_fields: SpecialFields::default(),
+    });
 
     let mut v1frame = offline_wire_formats::V1Frame::new();
     v1frame.set_type(FrameType::CONNECTION_RESPONSE);
@@ -504,12 +590,14 @@ async fn process(mut socket: TcpStream) -> io::Result<()> {
             &decrypt_key,
             &receive_hmac_key,
             &mut client_seq_num,
-        ).await {
-            TransferResult::Nothing => {},
+        )
+        .await
+        {
+            TransferResult::Nothing => {}
             TransferResult::Frame(frame) => {
                 println!("< {:?}", frame);
-                break
-            },
+                break;
+            }
             TransferResult::Bytes(id, data) => panic!("unexpected file {} {:?}", id, data),
             TransferResult::Keepalive => reply_keepalive(&mut socket).await,
         }
@@ -534,7 +622,14 @@ async fn process(mut socket: TcpStream) -> io::Result<()> {
     frame.set_version(frame::Version::V1);
     frame.v1 = Some(v1frame).into();
 
-    send_frame(&mut socket, &frame, &encrypt_key, &send_hmac_key, &mut server_seq_num).await;
+    send_frame(
+        &mut socket,
+        &frame,
+        &encrypt_key,
+        &send_hmac_key,
+        &mut server_seq_num,
+    )
+    .await;
 
     loop {
         match read_next_transfer(
@@ -543,12 +638,14 @@ async fn process(mut socket: TcpStream) -> io::Result<()> {
             &decrypt_key,
             &receive_hmac_key,
             &mut client_seq_num,
-        ).await {
-            TransferResult::Nothing => {},
+        )
+        .await
+        {
+            TransferResult::Nothing => {}
             TransferResult::Frame(frame) => {
                 println!("< {:?}", frame);
-                break
-            },
+                break;
+            }
             TransferResult::Bytes(id, data) => panic!("unexpected file {} {:?}", id, data),
             TransferResult::Keepalive => reply_keepalive(&mut socket).await,
         }
@@ -566,7 +663,14 @@ async fn process(mut socket: TcpStream) -> io::Result<()> {
     frame.set_version(frame::Version::V1);
     frame.v1 = Some(v1frame).into();
 
-    send_frame(&mut socket, &frame, &encrypt_key, &send_hmac_key, &mut server_seq_num).await;
+    send_frame(
+        &mut socket,
+        &frame,
+        &encrypt_key,
+        &send_hmac_key,
+        &mut server_seq_num,
+    )
+    .await;
 
     let intro_frame = loop {
         match read_next_transfer(
@@ -575,17 +679,22 @@ async fn process(mut socket: TcpStream) -> io::Result<()> {
             &decrypt_key,
             &receive_hmac_key,
             &mut client_seq_num,
-        ).await {
-            TransferResult::Nothing => {},
+        )
+        .await
+        {
+            TransferResult::Nothing => {}
             TransferResult::Frame(frame) => {
                 println!("< {:?}", frame);
-                break frame
-            },
+                break frame;
+            }
             TransferResult::Bytes(id, data) => panic!("unexpected file {} {:?}", id, data),
             TransferResult::Keepalive => reply_keepalive(&mut socket).await,
         }
     };
-    assert_eq!(intro_frame.v1.type_(), wire_format::v1frame::FrameType::INTRODUCTION);
+    assert_eq!(
+        intro_frame.v1.type_(),
+        wire_format::v1frame::FrameType::INTRODUCTION
+    );
     let files = &intro_frame.v1.introduction.file_metadata;
     for file in files {
         let filename = file.name();
@@ -619,7 +728,14 @@ async fn process(mut socket: TcpStream) -> io::Result<()> {
     frame.set_version(frame::Version::V1);
     frame.v1 = Some(v1frame).into();
 
-    send_frame(&mut socket, &frame, &encrypt_key, &send_hmac_key, &mut server_seq_num).await;
+    send_frame(
+        &mut socket,
+        &frame,
+        &encrypt_key,
+        &send_hmac_key,
+        &mut server_seq_num,
+    )
+    .await;
 
     let mut received_files = 0;
 
@@ -630,24 +746,29 @@ async fn process(mut socket: TcpStream) -> io::Result<()> {
             &decrypt_key,
             &receive_hmac_key,
             &mut client_seq_num,
-        ).await {
-            TransferResult::Nothing => {},
+        )
+        .await
+        {
+            TransferResult::Nothing => {}
             TransferResult::Keepalive => reply_keepalive(&mut socket).await,
             TransferResult::Frame(frame) => {
                 dbg!(frame);
-            },
+            }
             TransferResult::Bytes(id, data) => {
                 dbg!(id);
 
                 let file = files.iter().find(|f| f.payload_id() == id).unwrap();
                 println!("received file: {} {:?}", file.name(), file.type_());
-                std::fs::File::create(file.name()).unwrap().write_all(&data).unwrap();
+                std::fs::File::create(file.name())
+                    .unwrap()
+                    .write_all(&data)
+                    .unwrap();
                 received_files += 1;
 
                 if received_files == files.len() {
-                    break
+                    break;
                 }
-            },
+            }
         }
     }
 
